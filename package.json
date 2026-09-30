@@ -1,0 +1,40 @@
+{
+  "name": "el_faouar_school",
+  "version": "1.0.2",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "vite",
+    "build": "vite build",
+    "electron": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.el_faouar_school.id",
+    "productName": "El Faouar School",
+    "files": [
+      "main.js",
+      "frontend/**/*",
+      "!node_modules/**/*"
+    ],
+    "win": {
+      "icon": "assets/logoWithOutBg.png",
+      "target": "nsis"
+    },
+    "mac": {
+      "icon": "assets/logoWithOutBg.png"
+    },
+    "linux": {
+      "icon": "assets/logoWithOutBg.png",
+      "target": "AppImage"
+    }
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
+  }
+}
