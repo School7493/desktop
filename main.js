@@ -1,11 +1,19 @@
-const { app, BrowserWindow, dialog, globalShortcut, shell } = require("electron");
+const { app, BrowserWindow, dialog, globalShortcut, shell, ipcMain } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { autoUpdater } = require("electron-updater");
 
 const logFile = path.join(app.getPath("userData"), "app.log");
 
+// How long to wait for the update check before opening the app anyway
+const UPDATE_CHECK_TIMEOUT_MS = 15000;
+
 let mainWindow = null;
+let updateWindow = null;
+let appStarted = false;
+let installing = false;
+let updateFound = false;
+let checkTimer = null;
 
 function log(...args) {
     const line = "[" + new Date().toISOString() + "] " + args.join(" ") + "\n";
@@ -35,6 +43,13 @@ process.on("unhandledRejection", (reason) => {
     );
 });
 
+// Version of the installed app (read by the React Settings page)
+ipcMain.handle("app:getVersion", () => app.getVersion());
+
+/* ------------------------------------------------------------------ */
+/* Main window                                                         */
+/* ------------------------------------------------------------------ */
+
 function createWindow() {
     try {
         mainWindow = new BrowserWindow({
@@ -45,6 +60,7 @@ function createWindow() {
                 devTools: true,
                 contextIsolation: true,
                 nodeIntegration: false,
+                preload: path.join(__dirname, "preload.js"),
             },
         });
 
@@ -71,6 +87,140 @@ function createWindow() {
     }
 }
 
+// Opens the real app (only once)
+function startApp() {
+    if (appStarted) return;
+    appStarted = true;
+
+    clearTimeout(checkTimer);
+
+    // Create the main window first so "window-all-closed" never fires in between
+    createWindow();
+    closeUpdateWindow();
+}
+
+/* ------------------------------------------------------------------ */
+/* Required-update window                                              */
+/* ------------------------------------------------------------------ */
+
+function buildUpdateHtml(version) {
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        font-family: "Segoe UI", Arial, sans-serif;
+        background: #1e1f26;
+        color: #fff;
+        user-select: none;
+    }
+    h2 { margin: 0 0 8px; font-weight: 600; }
+    p { margin: 0 0 20px; color: #b8bcc8; font-size: 14px; }
+    .bar {
+        width: 320px;
+        height: 10px;
+        background: #35363f;
+        border-radius: 5px;
+        overflow: hidden;
+    }
+    .fill {
+        width: 0%;
+        height: 100%;
+        background: #4f8cff;
+        transition: width 0.2s;
+    }
+    #status { margin-top: 14px; font-size: 13px; color: #b8bcc8; }
+</style>
+</head>
+<body>
+    <h2>Update required</h2>
+    <p>Version ${version} must be installed to continue.</p>
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <div id="status">Starting download...</div>
+    <script>
+        window.setProgress = function (percent) {
+            document.getElementById("fill").style.width = percent + "%";
+            document.getElementById("status").textContent =
+                "Downloading... " + percent.toFixed(0) + "%";
+        };
+        window.setStatus = function (text) {
+            document.getElementById("status").textContent = text;
+        };
+    </script>
+</body>
+</html>`;
+
+    return "data:text/html;charset=utf-8," + encodeURIComponent(html);
+}
+
+function showUpdateWindow(version) {
+    if (updateWindow) return;
+
+    updateWindow = new BrowserWindow({
+        width: 460,
+        height: 260,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        autoHideMenuBar: true,
+        title: "Update required",
+        webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+    });
+
+    updateWindow.setMenu(null);
+
+    // Closing the update window without updating quits the app
+    updateWindow.on("closed", () => {
+        updateWindow = null;
+
+        if (!appStarted && !installing) {
+            log("Update window closed, quitting app");
+            app.quit();
+        }
+    });
+
+    updateWindow.loadURL(buildUpdateHtml(version));
+}
+
+function closeUpdateWindow() {
+    if (updateWindow) {
+        updateWindow.removeAllListeners("closed");
+        updateWindow.close();
+        updateWindow = null;
+    }
+}
+
+function updateUi(js) {
+    if (updateWindow && !updateWindow.isDestroyed()) {
+        updateWindow.webContents.executeJavaScript(js).catch(() => {});
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Auto updater                                                        */
+/* ------------------------------------------------------------------ */
+
+function startDownload() {
+    updateUi('window.setStatus("Starting download...")');
+
+    autoUpdater.downloadUpdate().catch((err) => {
+        // The "error" event handler below shows the retry dialog
+        log("Download failed:", err.message);
+    });
+}
+
 function setupAutoUpdater() {
     autoUpdater.logger = {
         info: (...args) => log("UPDATER INFO:", ...args),
@@ -79,98 +229,111 @@ function setupAutoUpdater() {
         debug: (...args) => log("UPDATER DEBUG:", ...args),
     };
 
-    // Ask the user first: do NOT download automatically
+    // We trigger the download ourselves once the required window is visible
     autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.autoInstallOnAppQuit = false;
 
     autoUpdater.on("checking-for-update", () => {
         log("Checking for update...");
     });
 
-    autoUpdater.on("update-available", async (info) => {
+    autoUpdater.on("update-available", (info) => {
         log("Update available:", info.version);
 
-        const { response } = await dialog.showMessageBox(mainWindow, {
-            type: "info",
-            title: "Update available",
-            message: "A new version (" + info.version + ") is available.",
-            detail:
-                "You are using version " +
-                app.getVersion() +
-                ". Do you want to download and install the update?",
-            buttons: ["Update now", "Later"],
-            defaultId: 0,
-            cancelId: 1,
-        });
+        updateFound = true;
+        clearTimeout(checkTimer);
 
-        if (response === 0) {
-            log("User accepted update, downloading...");
-            autoUpdater.downloadUpdate().catch((err) => {
-                log("Download failed:", err.message);
-                dialog.showErrorBox("Update failed", err.message);
-            });
-        } else {
-            log("User postponed update");
-        }
+        showUpdateWindow(info.version);
+        startDownload();
     });
 
     autoUpdater.on("update-not-available", (info) => {
         log("No update available. Current version:", info.version);
-    });
-
-    autoUpdater.on("error", (err) => {
-        log("UPDATE ERROR:", err.stack || err.message);
+        startApp();
     });
 
     autoUpdater.on("download-progress", (progress) => {
         log("Download progress: " + progress.percent.toFixed(1) + "%");
 
-        // Show progress on the taskbar icon
-        if (mainWindow) {
-            mainWindow.setProgressBar(progress.percent / 100);
+        updateUi("window.setProgress(" + progress.percent + ")");
+
+        if (updateWindow && !updateWindow.isDestroyed()) {
+            updateWindow.setProgressBar(progress.percent / 100);
         }
     });
 
-    autoUpdater.on("update-downloaded", async (info) => {
+    autoUpdater.on("update-downloaded", (info) => {
         log("Update downloaded:", info.version);
 
-        if (mainWindow) {
-            mainWindow.setProgressBar(-1);
+        installing = true;
+
+        updateUi('window.setStatus("Installing update, the app will restart...")');
+
+        // Short delay so the user sees the message
+        setTimeout(() => {
+            autoUpdater.quitAndInstall(false, true);
+        }, 1000);
+    });
+
+    autoUpdater.on("error", async (err) => {
+        log("UPDATE ERROR:", err.stack || err.message);
+
+        // Error while checking: don't lock the user out, open the app
+        if (!updateFound) {
+            startApp();
+            return;
         }
 
-        const { response } = await dialog.showMessageBox(mainWindow, {
-            type: "info",
-            title: "Update ready",
-            message: "Version " + info.version + " has been downloaded.",
-            detail: "Restart the application now to install it?",
-            buttons: ["Restart now", "Later"],
+        // Error while downloading a required update: retry or quit
+        const { response } = await dialog.showMessageBox(updateWindow, {
+            type: "error",
+            title: "Update failed",
+            message: "The update could not be downloaded.",
+            detail:
+                err.message +
+                "\n\nThe update is required to use the application.",
+            buttons: ["Retry", "Quit"],
             defaultId: 0,
             cancelId: 1,
         });
 
         if (response === 0) {
-            autoUpdater.quitAndInstall();
+            startDownload();
         } else {
-            log("User postponed install, will install on quit");
+            installing = false;
+            app.quit();
         }
     });
+
+    // If the check hangs (no network, server down), open the app anyway
+    checkTimer = setTimeout(() => {
+        if (!updateFound) {
+            log("Update check timed out, starting app");
+            startApp();
+        }
+    }, UPDATE_CHECK_TIMEOUT_MS);
 
     autoUpdater.checkForUpdates().catch((err) => {
         log("Update check failed:", err.message);
     });
 }
 
-app.whenReady().then(() => {
-    createWindow();
+/* ------------------------------------------------------------------ */
+/* App lifecycle                                                       */
+/* ------------------------------------------------------------------ */
 
+app.whenReady().then(() => {
     // Ctrl+Shift+L opens the log file
     globalShortcut.register("CommandOrControl+Shift+L", () => {
         shell.openPath(logFile);
     });
 
-    // Only check for updates in the packaged application
     if (app.isPackaged) {
+        // Packaged app: check for a required update before opening
         setupAutoUpdater();
+    } else {
+        // Dev mode: no updates, open directly
+        startApp();
     }
 });
 

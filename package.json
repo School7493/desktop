@@ -1,6 +1,6 @@
 {
   "name": "el_faouar_school",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "main": "main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -14,6 +14,7 @@
     "productName": "El Faouar School",
     "files": [
       "main.js",
+      "preload.js",
       "frontend/**/*"
     ],
     "win": {
@@ -27,6 +28,8 @@
       "icon": "assets/logoWithOutBg.png",
       "target": "AppImage"
     },
+
+  
 
      "publish": [
       {
